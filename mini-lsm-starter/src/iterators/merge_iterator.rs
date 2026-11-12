@@ -15,12 +15,15 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
+use crate::key::{Key, KeySlice};
+use anyhow::Result;
+use nom::combinator::Peek;
+use std::borrow::Borrow;
 use std::cmp::{self};
 use std::collections::BinaryHeap;
-
-use anyhow::Result;
-
-use crate::key::KeySlice;
+use std::collections::binary_heap::PeekMut;
+use std::iter::Repeat;
+use std::mem;
 
 use super::StorageIterator;
 
@@ -59,7 +62,18 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     pub fn create(iters: Vec<Box<I>>) -> Self {
-        unimplemented!()
+        let mut heap: BinaryHeap<HeapWrapper<I>> = BinaryHeap::new();
+        iters
+            .into_iter()
+            .enumerate()
+            .filter(|(_, iter)| iter.is_valid())
+            .map(|(index, iter)| HeapWrapper(index, iter))
+            .for_each(|wrapper| heap.push(wrapper));
+        let current = heap.pop();
+        MergeIterator {
+            iters: heap,
+            current,
+        }
     }
 }
 
@@ -69,18 +83,79 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     type KeyType<'a> = KeySlice<'a>;
 
     fn key(&self) -> KeySlice<'_> {
-        unimplemented!()
+        let Some(iter) = &self.current else {
+            return KeySlice::from_slice(&[]);
+        };
+        iter.1.key()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        let Some(iter) = &self.current else {
+            return &[];
+        };
+        iter.1.value()
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        let Some(iter) = &self.current else {
+            return false;
+        };
+        iter.1.is_valid()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        let Some(cur) = self.current.as_mut() else {
+            return Ok(());
+        };
+
+        while let Some(mut top) = self.iters.peek_mut()
+            && top.1.key().eq(&cur.1.key())
+        {
+            match top.1.next() {
+                Ok(()) => {
+                    if !top.1.is_valid() {
+                        PeekMut::pop(top);
+                    }
+                }
+                Err(e) => {
+                    PeekMut::pop(top);
+                    return Err(e);
+                }
+            }
+        }
+
+        cur.1.next()?;
+
+        if let Some(mut top) = self.iters.peek_mut()
+            && (!cur.1.is_valid() || top.cmp(cur).is_gt())
+        {
+            if cur.1.is_valid() {
+                mem::swap(&mut *top, cur);
+            } else {
+                self.current = Some(PeekMut::pop(top));
+            }
+        }
+        Ok(())
     }
+
+    // fn next(&mut self) -> Result<()> {
+    //     let consumed_key = self.key().to_key_vec();
+    //
+    //     while let Some(mut top) = self.iters.peek_mut()
+    //         && top.1.key().eq(&consumed_key.as_key_slice())
+    //     {
+    //         match top.1.next() {
+    //             Ok(()) => {
+    //                 if !top.1.is_valid() {
+    //                     PeekMut::pop(top);
+    //                 }
+    //             }
+    //             Err(e) => {
+    //                 PeekMut::pop(top);
+    //                 return Err(e);
+    //             }
+    //         }
+    //     }
+    //     Ok(())
+    // }
 }

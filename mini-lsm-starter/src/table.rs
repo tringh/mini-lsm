@@ -23,9 +23,9 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
 pub use builder::SsTableBuilder;
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 pub use iterator::SsTableIterator;
 
 use crate::block::Block;
@@ -53,12 +53,34 @@ impl BlockMeta {
         #[allow(clippy::ptr_arg)] // remove this allow after you finish
         buf: &mut Vec<u8>,
     ) {
-        unimplemented!()
+        block_meta.iter().for_each(|m| {
+            buf.extend((m.offset as u32).to_le_bytes());
+            buf.extend((m.first_key.len() as u16).to_le_bytes());
+            buf.extend_from_slice(m.first_key.raw_ref());
+            buf.extend((m.last_key.len() as u16).to_le_bytes());
+            buf.extend_from_slice(m.last_key.raw_ref());
+        })
     }
 
     /// Decode block meta from a buffer.
     pub fn decode_block_meta(buf: impl Buf) -> Vec<BlockMeta> {
-        unimplemented!()
+        let mut buf = buf;
+        let mut result: Vec<BlockMeta> = Vec::new();
+        while buf.has_remaining() {
+            let offset = buf.get_u32_le() as usize;
+            let first_size = buf.get_u16_le() as usize;
+            let first_key = KeyBytes::from_bytes(buf.copy_to_bytes(first_size));
+            let last_size = buf.get_u16_le() as usize;
+            let last_key = KeyBytes::from_bytes(buf.copy_to_bytes(last_size));
+
+            let block_meta = BlockMeta {
+                offset,
+                first_key,
+                last_key,
+            };
+            result.push(block_meta);
+        }
+        result
     }
 }
 
@@ -122,7 +144,35 @@ impl SsTable {
 
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
-        unimplemented!()
+        let file_size = file.size();
+        let block_meta_offset =
+            u32::from_le_bytes(file.read(file.size() - 4, 4)?.as_slice().try_into()?) as u64;
+
+        let block_meta = BlockMeta::decode_block_meta(Bytes::from(
+            file.read(block_meta_offset, file.size() - block_meta_offset - 4)?,
+        ));
+
+        let first_key = block_meta
+            .first()
+            .map(|m| m.first_key.clone())
+            .unwrap_or(KeyBytes::default());
+
+        let last_key = block_meta
+            .last()
+            .map(|m| m.last_key.clone())
+            .unwrap_or(KeyBytes::default());
+
+        Ok(Self {
+            file,
+            block_meta,
+            block_meta_offset: block_meta_offset as usize,
+            id,
+            block_cache,
+            first_key,
+            last_key,
+            bloom: None,
+            max_ts: u64::MAX,
+        })
     }
 
     /// Create a mock SST with only first key + last key metadata
@@ -147,7 +197,16 @@ impl SsTable {
 
     /// Read a block from the disk.
     pub fn read_block(&self, block_idx: usize) -> Result<Arc<Block>> {
-        unimplemented!()
+        let meta = &self.block_meta[block_idx];
+        let offset = meta.offset;
+        let mut size = 0;
+        if block_idx == self.block_meta.len() - 1 {
+            size = self.block_meta_offset - offset;
+        } else {
+            size = self.block_meta[block_idx + 1].offset - offset;
+        }
+        let block = Block::decode(&self.file.read(offset as u64, size as u64)?);
+        Ok(Arc::new(block))
     }
 
     /// Read a block from disk, with block cache. (Day 4)
@@ -159,7 +218,22 @@ impl SsTable {
     /// Note: You may want to make use of the `first_key` stored in `BlockMeta`.
     /// You may also assume the key-value pairs stored in each consecutive block are sorted.
     pub fn find_block_idx(&self, key: KeySlice) -> usize {
-        unimplemented!()
+        let mut low = 0;
+        let mut hi = self.block_meta.len();
+        let key = key.to_key_vec().into_key_bytes();
+
+        while hi - low > 1 {
+            let mid = low + (hi - low) / 2;
+            let cmp = self.block_meta[mid].first_key.cmp(&key);
+            if cmp.is_gt() {
+                hi = mid;
+            } else if cmp.is_lt() {
+                low = mid;
+            } else {
+                return mid;
+            }
+        }
+        low
     }
 
     /// Get number of data blocks.
